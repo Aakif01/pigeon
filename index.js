@@ -14,12 +14,14 @@ const MongoStore = require('connect-mongo').default;
 const passport = require("passport");
 const LocalStrategy = require("passport-local");
 const ExpressError = require("./utils/ExpressError.js");
-const wrapAsync = require("./utils/wrapAsync.js");
-const User = require("./models/users/user.js")
+const User = require("./models/users/user.js");
 const Conversation = require("./models/chat/conversation.js");
 const Message = require("./models/chat/message.js");
 const multer = require("multer");
 const { storage } = require("./cloudConfig");
+const userRoutes = require("./routes/user.js");
+const chatRoutes = require("./routes/chat.js");
+const users = require("./usersStore.js");
 
 const upload = multer({ storage });
 
@@ -35,7 +37,7 @@ const store = MongoStore.create({
   touchAfter: 24*3600
 });
 
-store.on("error", () => {
+store.on("error", (error) => {
   console.log("ERROR in MONGO SESSION STORE", error)
 })
 
@@ -78,41 +80,6 @@ passport.serializeUser(User.serializeUser());
 passport.deserializeUser(User.deserializeUser());
 
 
-
-function isLoggedIn(req, res, next){
-  if(!req.user) {
-    return res.redirect("/pigeon/login");
-    
-  }
-  next();
-}
-
-async function isMember(req, res, next) {
-  try {
-    let { convoId } = req.params;
-
-    let conversation = await Conversation.findOne({
-      _id: convoId,
-      members: req.user._id
-    });
-
-    if (!conversation) {
-      req.flash("error", "permission denied")
-      return res.redirect("/pigeon");
-    }
-
-    req.conversation = conversation;
-
-    next();
-
-  } catch (err) {
-    console.log(err);
-    return res.redirect("/pigeon");
-  }
-}
-
-const users = {};
-
 app.use( async(req, res, next) => {
   if(req.path !== "/pigeon"){
   res.locals.success = req.flash("success");
@@ -127,203 +94,8 @@ app.get("/", (req, res) => {
   res.redirect("/pigeon");
 })
 
-app.get("/pigeon", isLoggedIn, (req, res) => {
-  res.status(200).render("chat/loading.ejs")
-})
-
-app.get("/pigeon/data", isLoggedIn, wrapAsync(async(req, res) => {
-  let userId = req.user._id;
-  let user = await User.findById(userId).populate("friends.user").populate("friends.convoId");
-  
-  user.friends.sort((a, b) => {
-
-  let timeA = a.convoId?.lastMessageAt || 0;
-  let timeB = b.convoId?.lastMessageAt || 0;
-
-  return timeB - timeA;
-
-});
-  
-  res.render("chat/home.ejs", { user })
-}));
-
-app.get("/pigeon/register", (req, res) => {
-  res.status(200).render("user/register.ejs")
-})
-
-app.post("/pigeon/register", wrapAsync(async(req, res) => {
-  try{
-    
-  let {phone, password} = req.body;
-  
-  let newUser = new User({
-    phone: phone,
-    friends: []
-  });
-  
-  const registeredUser = await User.register(newUser, password);
-  
-  req.login(registeredUser, (err) => {
-
-      if (err) return next(err);
-
-      res.redirect("/pigeon/user"); 
-
-    });
-  } catch(err){
-    console.log(err);
-    req.flash("error", err.message)
-    res.redirect("/pigeon/register");
-  }
-}));
-
-app.get("/pigeon/user", isLoggedIn, (req, res) => {
-  res.render("user/user.ejs");
-});
-
-app.post(
-  "/pigeon/user/update",
-  isLoggedIn,
-  upload.single("dp"),
-  wrapAsync(async (req, res) => {
-
-    try {
-
-      let userId = req.user._id;
-
-      let updateData = {};
-
-      if (req.body.username && req.body.username.trim() !== "") {
-
-        updateData.username =
-          req.body.username.trim();
-
-      }
-
-      if (req.file) {
-
-        updateData.profile = {
-          url: req.file.path,
-          filename: req.file.filename
-        };
-
-      }
-
-      if (Object.keys(updateData).length > 0) {
-
-        await User.findByIdAndUpdate(
-          userId,
-          updateData
-        );
-
-      }
-
-      res.redirect("/pigeon/");
-
-    } catch (err) {
-
-      req.flash("error", err.message)
-      res.redirect("/pigeon/user");
-
-    }
-
-  }
-));
-
-app.get("/pigeon/login", (req, res) => {
-  res.status(200).render("user/login.ejs")
-})
-
-app.post(
-  "/pigeon/login",
-  passport.authenticate("local", {
-    successRedirect: "/pigeon",
-    failureRedirect: "/pigeon/login",
-    failureFlash: true
-  })
-);
-
-app.get("/pigeon/logout", (req, res) => {
-  req.logout( (err) => {
-    if(err){
-      next(err);
-    }
-    req.flash("success", "You are logged out!")
-    res.redirect("/pigeon/login")
-  });
-})
-
-app.get("/pigeon/new", (req, res) => {
-  res.status(200).render("user/friend.ejs")
-});
-
-app.post("/pigeon/new", wrapAsync(async(req, res) => {
-  let {phone, firstName, lastName} = req.body;
-  
-  if(!firstName){
-    if(lastName){
-      firstName = lastName;
-      lastName = "";
-    } else{
-      firstName = `+91${phone}`
-    }
-  }
-  
-  if(!phone){
-    req.flash("error", "Phone Number is required");
-    return res.status(400).redirect("/pigeon/new")
-  }
-  
-  let friend = await User.findOne({ phone }).populate("friends.user");
-  if(!friend){
-    req.flash("error", "user not found. Invite them on pigeon")
-    return res.status(404).redirect("/pigeon");
-  }
-  
-  let userId = req.user._id;
-  
-  let user = await User.findById(userId).populate("friends.user");
-  
-  if(friend._id.toString() === userId.toString()) return res.redirect("/pigeon");
-  
-  let convo = await Conversation.findOne({ members: { $all: [userId, friend._id] } });
-
-  if (!convo) {
-    convo = new Conversation({ members: [userId, friend._id] });
-    await convo.save();
-  }
-  await User.updateOne({ _id: userId, "friends.user": { $ne: friend._id } }, {
-    $push: {
-      friends: {
-        convoId: convo._id,
-        user: friend._id,
-        firstName,
-        lastName
-      }
-    }
-  }
-);
-
-res.status(201).redirect("/pigeon");
-}));
-
-app.get("/pigeon/chat/:convoId",  isLoggedIn, isMember, wrapAsync(async(req, res) => {
-  let {convoId} = req.params
-  let conversation = req.conversation;
-  let messages = await Message.find({ conversation: convoId });
-  
-  let friendId = conversation.members.find(
-  member => member.toString() !== req.user._id.toString()
-);
-
-  let friend = await User.findById(friendId);
-  
-  let friendInfo = req.user.friends.find( f => f.user.toString() == friendId.toString());
-  
-  let name = friendInfo.firstName + " " + friendInfo.lastName || " ";
-  
-  res.render("chat/chat.ejs", {friend, messages, convoId, name})
-}))
+app.use("/pigeon", chatRoutes);
+app.use("/pigeon", userRoutes);
 
 const wss = new webSocket.Server({ server });
 
